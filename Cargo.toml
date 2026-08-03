@@ -47,6 +47,7 @@ uuid = { version = "1.23", features = ["v4", "serde"] }
 url = "2.5"
 
 [dev-dependencies]
+cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "test-util"] }
 wiremock = "0.6"
 
