@@ -1,0 +1,31 @@
+[package]
+name = "armature-webhooks-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Its own workspace root: `libfuzzer-sys` links a sanitizer runtime and builds
+# only on nightly, so a plain `cargo build` at the repo root must not reach it.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+armature-webhooks = { path = ".." }
+
+# The GitHub-style `sha256=` scheme has no signer in the crate, so the harness
+# builds that header itself. Versions track armature-webhooks' own so the two
+# constructions cannot diverge on a crate upgrade.
+hmac = "0.13"
+sha2 = "0.11"
+hex = "0.4"
+
+[[bin]]
+name = "signature_verify"
+path = "fuzz_targets/signature_verify.rs"
+test = false
+doc = false
+bench = false
