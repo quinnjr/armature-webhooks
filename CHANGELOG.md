@@ -9,10 +9,12 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
-### Fixed
+## [0.5.0] - 2026-09-15
 
-- **Breaking:** the shared delivery body is `Bytes`, so it is genuinely shared rather than copied per endpoint.
-- Fan-out concurrency is bounded, and a receiver's response body is capped instead of buffered without limit on every attempt.
+### Changed
+
+- **Breaking:** requires `armature-core` 0.10 (was `0.9`); its types appear in this crate's API, so the requirement change is breaking here and the minor moves. Part of the `armature-core` 0.10 release train.
+- Dependencies bumped to their latest releases: `tokio` 1.52 → 1.53, `uuid` 1.23 → 1.26, `tokio` 1.52 → 1.53.
 
 ## [0.4.0] - 2026-08-05
 
