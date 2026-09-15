@@ -19,7 +19,7 @@ thiserror = "2.0"
 tracing = "0.1"
 
 # Async runtime
-tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 futures = "0.3"
 # Fan-out clones the serialized payload once per endpoint; `Bytes` makes that a
 # refcount bump instead of a full copy of the body per subscriber.
@@ -41,13 +41,13 @@ hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Unique identifiers
-uuid = { version = "1.23", features = ["v4", "serde"] }
+uuid = { version = "1.26", features = ["v4", "serde"] }
 
 # URL parsing
 url = "2.5"
 
 [dev-dependencies]
 cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "test-util"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "test-util"] }
 wiremock = "0.6"
 
