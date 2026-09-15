@@ -1,25 +1,25 @@
 [package]
 name = "armature-webhooks"
-version = "0.3.0"
-edition.workspace = true
-rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.94.1"
+authors = ["Joseph Quinn <quinn.josephr@proton.me>"]
+license = "Apache-2.0"
 repository = "https://github.com/quinnjr/armature-webhooks"
-homepage.workspace = true
+homepage = "https://quinnjr.github.io/armature"
 description = "Webhook sending and receiving for Armature"
 keywords = ["webhooks", "events", "http", "notifications"]
 categories = ["web-programming", "asynchronous"]
 
 [dependencies]
 # Core dependencies
-armature-core = { path = "../armature-core", version = "0" }
+armature-core = { version = "0.10" }
 async-trait = "0.1"
 thiserror = "2.0"
 tracing = "0.1"
 
 # Async runtime
-tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 futures = "0.3"
 # Fan-out clones the serialized payload once per endpoint; `Bytes` makes that a
 # refcount bump instead of a full copy of the body per subscriber.
@@ -41,13 +41,13 @@ hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Unique identifiers
-uuid = { version = "1.23", features = ["v4", "serde"] }
+uuid = { version = "1.26", features = ["v4", "serde"] }
 
 # URL parsing
 url = "2.5"
 
 [dev-dependencies]
 cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "test-util"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "test-util"] }
 wiremock = "0.6"
 
