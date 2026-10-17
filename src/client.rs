@@ -4,6 +4,7 @@ use crate::{
     Result, WebhookConfig, WebhookDelivery, WebhookDeliveryStatus, WebhookEndpoint, WebhookError,
     WebhookPayload, WebhookRegistry, WebhookSignature,
 };
+use armature_http_client::egress::EgressError;
 use bytes::Bytes;
 use chrono::Utc;
 use futures::stream::StreamExt;
@@ -12,6 +13,13 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 /// Client for sending webhook deliveries
+///
+/// Endpoint URLs are untrusted (typically registered by tenants), so every
+/// delivery goes through the configured
+/// [`EgressPolicy`](armature_http_client::egress::EgressPolicy): the URL is
+/// checked before sending, every DNS answer is vetted when a connection is
+/// opened (and the connection is made to exactly the vetted addresses),
+/// redirects are never followed, and proxies are never used.
 #[derive(Debug, Clone)]
 pub struct WebhookClient {
     config: WebhookConfig,
@@ -22,12 +30,23 @@ pub struct WebhookClient {
 impl WebhookClient {
     /// Create a new webhook client with default configuration
     pub fn new(config: WebhookConfig) -> Self {
-        let http_client = Client::builder()
-            .timeout(config.timeout)
-            .user_agent(&config.user_agent)
-            .danger_accept_invalid_certs(!config.verify_ssl)
-            .build()
-            .expect("Failed to create HTTP client");
+        let builder = config.egress.apply(
+            Client::builder()
+                .timeout(config.timeout)
+                .user_agent(&config.user_agent),
+        );
+        #[cfg(feature = "dangerous-insecure-tls")]
+        let builder = {
+            if !config.verify_ssl {
+                warn!(
+                    "WebhookConfig::verify_ssl is false: TLS certificates of webhook \
+                     receivers are NOT verified; anyone on the network path can \
+                     impersonate them. Never use this in production."
+                );
+            }
+            builder.danger_accept_invalid_certs(!config.verify_ssl)
+        };
+        let http_client = builder.build().expect("Failed to create HTTP client");
 
         Self {
             config,
@@ -63,8 +82,19 @@ impl WebhookClient {
         payload: WebhookPayload,
         secret: Option<&str>,
     ) -> Result<WebhookDelivery> {
+        let signer = secret
+            .map(|s| {
+                WebhookSignature::new(s).map(|s| s.with_algorithm(self.config.signing_algorithm))
+            })
+            .transpose()?;
+
         let mut delivery = WebhookDelivery::new(payload, url);
         delivery.status = WebhookDeliveryStatus::InProgress;
+
+        if let Err(e) = self.check_url(url) {
+            delivery.mark_failed(e.to_string(), None);
+            return Ok(delivery);
+        }
 
         let body = Bytes::from(delivery.payload.to_bytes()?);
 
@@ -89,9 +119,7 @@ impl WebhookClient {
             .header("X-Webhook-Id", &delivery.id)
             .header("X-Webhook-Event", &delivery.payload.event);
 
-        if let Some(secret) = secret {
-            let signer =
-                WebhookSignature::new(secret).with_algorithm(self.config.signing_algorithm);
+        if let Some(signer) = signer {
             let signature = signer.sign(&body);
             request = request.header("X-Webhook-Signature", signature);
         }
@@ -138,6 +166,13 @@ impl WebhookClient {
         let mut delivery = WebhookDelivery::new(payload, &endpoint.url);
         delivery.status = WebhookDeliveryStatus::InProgress;
 
+        // Re-validate on every delivery: endpoints are plain data (and
+        // `Deserialize`), so a registry is not the only way one gets here.
+        if let Err(e) = endpoint.validate(&self.config.egress) {
+            delivery.mark_failed(e.to_string(), None);
+            return Ok(delivery);
+        }
+
         // Check payload size
         if body.len() > self.config.max_payload_size {
             delivery.mark_failed(
@@ -153,7 +188,7 @@ impl WebhookClient {
 
         // Sign the payload
         let signer =
-            WebhookSignature::new(&endpoint.secret).with_algorithm(self.config.signing_algorithm);
+            WebhookSignature::new(&endpoint.secret)?.with_algorithm(self.config.signing_algorithm);
         let signature = signer.sign(&body);
 
         // Build request
@@ -165,7 +200,8 @@ impl WebhookClient {
             .header("X-Webhook-Event", &delivery.payload.event)
             .header("X-Webhook-Signature", signature);
 
-        // Add custom headers from endpoint
+        // Custom headers from the endpoint (already checked against the
+        // deny list by `validate` above).
         for (key, value) in &endpoint.headers {
             request = request.header(key, value);
         }
@@ -277,7 +313,13 @@ impl WebhookClient {
             match request.send().await {
                 Ok(response) => {
                     let status = response.status();
-                    let body = self.read_capped_body(response).await;
+                    let body = if self.config.store_response_bodies {
+                        self.read_capped_body(response).await
+                    } else {
+                        // Dropped unread: closes the connection instead of
+                        // draining whatever the receiver sends back.
+                        None
+                    };
 
                     if status.is_success() {
                         info!(
@@ -314,6 +356,14 @@ impl WebhookClient {
                     tokio::time::sleep(delay).await;
                 }
                 Err(e) => {
+                    // A policy refusal (the name resolved to an internal
+                    // address) is permanent: retrying would only re-resolve.
+                    if let Some(refused) = EgressError::find_in(&e) {
+                        warn!("Webhook delivery refused by egress policy: {}", refused);
+                        delivery.mark_failed(refused.to_string(), None);
+                        return Ok(());
+                    }
+
                     let should_retry = policy.should_retry(attempt);
                     let next_retry = if should_retry {
                         let delay = policy.delay_for_attempt(attempt);
@@ -384,6 +434,14 @@ impl WebhookClient {
         Some(String::from_utf8_lossy(&buf).into_owned())
     }
 
+    /// Literal egress checks for an ad-hoc delivery URL.
+    fn check_url(&self, url: &str) -> Result<()> {
+        let parsed = url::Url::parse(url)
+            .map_err(|_| WebhookError::InvalidEndpoint("URL does not parse".to_string()))?;
+        self.config.egress.check_url(&parsed)?;
+        Ok(())
+    }
+
     /// Determine if a status code should be retried
     fn should_retry_status(status: u16) -> bool {
         matches!(
@@ -413,9 +471,30 @@ impl Default for WebhookClient {
 mod tests {
     use super::*;
     use crate::WebhookEndpoint;
+    use armature_http_client::egress::{EgressPolicy, HostResolver};
+    use std::net::SocketAddr;
     use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SECRET: &str = "test-secret-that-is-at-least-32-bytes-long";
+
+    /// Local stubs listen on 127.0.0.1, which the default policy refuses.
+    fn loopback() -> EgressPolicy {
+        EgressPolicy::default().allow_insecure_loopback(true)
+    }
+
+    fn local_config() -> crate::WebhookConfigBuilder {
+        WebhookConfig::builder().egress_policy(loopback())
+    }
+
+    fn local_endpoint(url: String) -> crate::WebhookEndpointBuilder {
+        WebhookEndpoint::builder(url).secret(SECRET)
+    }
+
+    fn local_registry() -> Arc<WebhookRegistry> {
+        Arc::new(WebhookRegistry::with_egress_policy(loopback()))
+    }
 
     #[test]
     fn test_client_creation() {
@@ -453,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_payload_too_large() {
-        let config = WebhookConfig::builder().max_payload_size(10).build();
+        let config = local_config().max_payload_size(10).build();
         let client = WebhookClient::new(config);
 
         let payload = WebhookPayload::new("test")
@@ -487,19 +566,25 @@ mod tests {
             .mount(&server2)
             .await;
 
-        let registry = Arc::new(WebhookRegistry::new());
-        registry.register(
-            WebhookEndpoint::builder(format!("{}/hook", server1.uri()))
-                .events(vec!["order.created"])
-                .build(),
-        );
-        registry.register(
-            WebhookEndpoint::builder(format!("{}/hook", server2.uri()))
-                .events(vec!["order.created"])
-                .build(),
-        );
+        let registry = local_registry();
+        registry
+            .register(
+                local_endpoint(format!("{}/hook", server1.uri()))
+                    .events(vec!["order.created"])
+                    .build_with_policy(&loopback())
+                    .unwrap(),
+            )
+            .unwrap();
+        registry
+            .register(
+                local_endpoint(format!("{}/hook", server2.uri()))
+                    .events(vec!["order.created"])
+                    .build_with_policy(&loopback())
+                    .unwrap(),
+            )
+            .unwrap();
 
-        let client = WebhookClient::with_registry(WebhookConfig::default(), registry);
+        let client = WebhookClient::with_registry(local_config().build(), registry);
         let payload = WebhookPayload::new("order.created").with_data(serde_json::json!({}));
 
         let deliveries = client.dispatch(payload).await.unwrap();
@@ -533,19 +618,25 @@ mod tests {
             .mount(&fast_bad)
             .await;
 
-        let registry = Arc::new(WebhookRegistry::new());
-        registry.register(
-            WebhookEndpoint::builder(format!("{}/hook", slow_ok.uri()))
-                .events(vec!["order.created"])
-                .build(),
-        );
-        registry.register(
-            WebhookEndpoint::builder(format!("{}/hook", fast_bad.uri()))
-                .events(vec!["order.created"])
-                .build(),
-        );
+        let registry = local_registry();
+        registry
+            .register(
+                local_endpoint(format!("{}/hook", slow_ok.uri()))
+                    .events(vec!["order.created"])
+                    .build_with_policy(&loopback())
+                    .unwrap(),
+            )
+            .unwrap();
+        registry
+            .register(
+                local_endpoint(format!("{}/hook", fast_bad.uri()))
+                    .events(vec!["order.created"])
+                    .build_with_policy(&loopback())
+                    .unwrap(),
+            )
+            .unwrap();
 
-        let config = WebhookConfig::builder()
+        let config = local_config()
             .max_concurrent_deliveries(4)
             .no_retries()
             .build();
@@ -569,7 +660,7 @@ mod tests {
     /// A concurrency limit throttles the fan-out; it must not drop endpoints.
     #[tokio::test]
     async fn test_dispatch_delivers_to_every_endpoint_with_a_limit_of_one() {
-        let registry = Arc::new(WebhookRegistry::new());
+        let registry = local_registry();
         let mut servers = Vec::new();
 
         for _ in 0..3 {
@@ -580,17 +671,18 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
-            registry.register(
-                WebhookEndpoint::builder(format!("{}/hook", server.uri()))
-                    .events(vec!["order.created"])
-                    .build(),
-            );
+            registry
+                .register(
+                    local_endpoint(format!("{}/hook", server.uri()))
+                        .events(vec!["order.created"])
+                        .build_with_policy(&loopback())
+                        .unwrap(),
+                )
+                .unwrap();
             servers.push(server);
         }
 
-        let config = WebhookConfig::builder()
-            .max_concurrent_deliveries(1)
-            .build();
+        let config = local_config().max_concurrent_deliveries(1).build();
         let client = WebhookClient::with_registry(config, registry);
 
         let deliveries = client
@@ -617,7 +709,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = WebhookConfig::builder().max_response_body_size(64).build();
+        let config = local_config().max_response_body_size(64).build();
         let client = WebhookClient::new(config);
 
         let response = client
@@ -647,16 +739,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let secret = "secret";
-        let config = WebhookConfig::builder()
+        let secret = SECRET;
+        let config = local_config()
             .signing_algorithm(crate::SigningAlgorithm::HmacSha512)
             .build();
         let client = WebhookClient::new(config);
 
-        let endpoint = WebhookEndpoint::builder(format!("{}/hook", server.uri()))
-            .secret(secret)
+        let endpoint = local_endpoint(format!("{}/hook", server.uri()))
             .events(vec!["order.created"])
-            .build();
+            .build_with_policy(&loopback())
+            .unwrap();
 
         let payload = WebhookPayload::new("order.created").with_data(serde_json::json!({}));
         let body = payload.to_bytes().unwrap();
@@ -679,13 +771,14 @@ mod tests {
             .unwrap();
 
         // SHA-512 hex digest is 128 chars; SHA-256 would be 64.
-        let v1 = signature_header.split("v1=").nth(1).unwrap();
-        assert_eq!(v1.len(), 128);
+        let v2 = signature_header.split("v2=").nth(1).unwrap();
+        assert_eq!(v2.len(), 128);
 
         // And it must be an actual valid HMAC-SHA512 signature over the body,
         // independently verified via `WebhookSignature` configured for SHA-512.
-        let independent_verifier =
-            WebhookSignature::new(secret).with_algorithm(crate::SigningAlgorithm::HmacSha512);
+        let independent_verifier = WebhookSignature::new(secret)
+            .unwrap()
+            .with_algorithm(crate::SigningAlgorithm::HmacSha512);
         assert!(
             independent_verifier
                 .verify(&body, signature_header, 300)
@@ -694,11 +787,191 @@ mod tests {
 
         // And an independent SHA-256 verifier must reject it (proves the
         // configured algorithm, not the default, was actually used).
-        let sha256_verifier = WebhookSignature::new(secret);
+        let sha256_verifier = WebhookSignature::new(secret).unwrap();
         assert!(
             !sha256_verifier
                 .verify(&body, signature_header, 300)
                 .unwrap()
         );
+    }
+
+    // ---- C2: SSRF regression tests -------------------------------------
+
+    #[tokio::test]
+    async fn redirect_to_metadata_is_not_followed_and_body_not_stored() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(
+                ResponseTemplate::new(303)
+                    .insert_header(
+                        "location",
+                        "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
+                    )
+                    .set_body_string("redirect body"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = WebhookClient::new(local_config().no_retries().build());
+        let endpoint = local_endpoint(format!("{}/hook", server.uri()))
+            .build_with_policy(&loopback())
+            .unwrap();
+        let delivery = client
+            .send_to_endpoint(&endpoint, WebhookPayload::new("e"))
+            .await
+            .unwrap();
+
+        assert_eq!(delivery.last_status_code, Some(303));
+        assert_eq!(delivery.status, WebhookDeliveryStatus::PermanentlyFailed);
+        assert_eq!(delivery.last_response_body, None);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_body_is_stored_only_when_opted_in() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("receiver says hi"))
+            .mount(&server)
+            .await;
+        let endpoint = local_endpoint(format!("{}/hook", server.uri()))
+            .build_with_policy(&loopback())
+            .unwrap();
+
+        let client = WebhookClient::new(local_config().build());
+        let delivery = client
+            .send_to_endpoint(&endpoint, WebhookPayload::new("e"))
+            .await
+            .unwrap();
+        assert_eq!(delivery.status, WebhookDeliveryStatus::Succeeded);
+        assert_eq!(delivery.last_response_body, None);
+
+        let client = WebhookClient::new(local_config().store_response_bodies(true).build());
+        let delivery = client
+            .send_to_endpoint(&endpoint, WebhookPayload::new("e"))
+            .await
+            .unwrap();
+        assert_eq!(
+            delivery.last_response_body.as_deref(),
+            Some("receiver says hi")
+        );
+    }
+
+    #[tokio::test]
+    async fn private_and_metadata_ip_literals_are_refused_without_a_request() {
+        let client = WebhookClient::new(WebhookConfig::default());
+        for url in [
+            "https://169.254.169.254/latest/meta-data/",
+            "https://10.0.0.1/hook",
+            "https://192.168.1.1/hook",
+            "https://[::ffff:169.254.169.254]/",
+            "https://[fd00::1]/",
+            "http://127.0.0.1:6379/",
+            "http://example.com/hook",
+        ] {
+            let delivery = client.send(url, WebhookPayload::new("e")).await.unwrap();
+            assert_eq!(
+                delivery.status,
+                WebhookDeliveryStatus::PermanentlyFailed,
+                "{url}"
+            );
+            assert_eq!(delivery.attempts, 1, "{url}");
+            assert!(delivery.last_status_code.is_none(), "{url}");
+            assert!(
+                delivery
+                    .last_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("egress refused"),
+                "{url}: {:?}",
+                delivery.last_error
+            );
+        }
+    }
+
+    struct FixedResolver(&'static str, std::net::IpAddr);
+
+    #[async_trait::async_trait]
+    impl HostResolver for FixedResolver {
+        async fn lookup(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            if host == self.0 {
+                Ok(vec![SocketAddr::new(self.1, port)])
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "nx"))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hostname_resolving_to_loopback_is_refused_at_connect() {
+        // A public-looking name with an A record of 127.0.0.1 passes every
+        // literal check; the guarded resolver must catch it when connecting.
+        let policy = EgressPolicy::default().with_resolver(Arc::new(FixedResolver(
+            "rebind.example",
+            "127.0.0.1".parse().unwrap(),
+        )));
+        let config = WebhookConfig::builder().egress_policy(policy).build();
+        let client = WebhookClient::new(config);
+
+        let endpoint = WebhookEndpoint::builder("https://rebind.example/hook")
+            .secret(SECRET)
+            .build()
+            .unwrap();
+        let delivery = client
+            .send_to_endpoint(&endpoint, WebhookPayload::new("e"))
+            .await
+            .unwrap();
+
+        assert_eq!(delivery.status, WebhookDeliveryStatus::PermanentlyFailed);
+        assert_eq!(delivery.attempts, 1, "a policy refusal must not be retried");
+        assert!(
+            delivery
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("internal address"),
+            "{:?}",
+            delivery.last_error
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_custom_header_is_never_sent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        // Bypass the builder (as a deserialized endpoint would).
+        let mut endpoint = local_endpoint(format!("{}/hook", server.uri()))
+            .build_with_policy(&loopback())
+            .unwrap();
+        endpoint
+            .headers
+            .insert("Metadata-Flavor".to_string(), "Google".to_string());
+
+        let client = WebhookClient::new(local_config().build());
+        let delivery = client
+            .send_to_endpoint(&endpoint, WebhookPayload::new("e"))
+            .await
+            .unwrap();
+        assert_eq!(delivery.status, WebhookDeliveryStatus::PermanentlyFailed);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn short_secret_is_refused() {
+        let client = WebhookClient::new(local_config().build());
+        let result = client
+            .send_with_secret(
+                "https://example.com/hook",
+                WebhookPayload::new("e"),
+                Some("short"),
+            )
+            .await;
+        assert!(matches!(result, Err(WebhookError::ConfigError(_))));
     }
 }

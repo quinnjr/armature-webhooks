@@ -9,6 +9,63 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+### Security
+
+- **Webhook delivery SSRF (C2).** Every delivery now goes through an
+  `EgressPolicy` (from `armature-http-client`): endpoint URLs must be `https`
+  and may not target loopback, private, link-local/cloud-metadata, or other
+  special-purpose addresses — checked on the URL and again on every DNS answer
+  when a connection is opened (re-resolved per new connection, connection
+  pinned to the vetted addresses). Redirects are never followed and system
+  proxies are never used. A policy refusal fails the delivery permanently
+  without retries.
+- Custom endpoint headers are validated against a deny-list (`Host`,
+  `Authorization`, `Cookie`, `Proxy-*`, `Metadata*`, `X-aws-ec2-metadata-token*`,
+  `X-Google-Metadata-Request`, hop-by-hop and framing headers, `Content-*`,
+  `X-Webhook-*`, `X-Hub-Signature*`, `Forwarded`/`X-Forwarded-*`) in
+  `WebhookEndpointBuilder::build`, `WebhookRegistry::register`/`update`, and
+  before every delivery.
+- Receivers' response bodies are no longer stored on `WebhookDelivery` by
+  default (`WebhookConfig::store_response_bodies`, opt-in, still capped by
+  `max_response_body_size`).
+- **Receiver hardening (M1).** The GitHub-style timestampless `sha256=` scheme
+  is no longer a silent fallback of every verifier: it is a separate,
+  receiver-scoped mode (`WebhookReceiver::github`) that honours the configured
+  algorithm (`sha512=` for HMAC-SHA512). Receivers keep a replay cache keyed by
+  the verified signature and the delivery id (`X-Webhook-Id` /
+  `X-GitHub-Delivery`) for the tolerance window, failing closed when full.
+- Signing secrets shorter than 32 bytes (including empty) are rejected;
+  generated secrets are 32 bytes from the OS CSPRNG (`whsec_` + 64 hex chars)
+  instead of a UUID plus a timestamp.
+- `Debug` for `WebhookSignature`, `WebhookReceiver` and `WebhookEndpoint` no
+  longer prints the secret (or custom header values) (H27).
+
+### Changed
+
+- **Breaking:** signature format is now `t=<ts>,v2=<hex>` with the MAC keyed by
+  `HMAC(key = "armature-webhooks/v2", msg = secret)` (domain separation from the
+  GitHub scheme). Migration: upgrade senders and receivers together;
+  third-party receivers must derive the key as documented in `signature.rs`.
+- **Breaking:** `WebhookSignature::new`, `WebhookReceiver::new`/`from_config`
+  return `Result`; `WebhookSignature::verify` no longer accepts `sha256=`
+  (use `verify_github` / `WebhookReceiver::github`).
+- **Breaking:** `WebhookEndpointBuilder::build` returns `Result` (use
+  `build_with_policy` for dev loopback targets); `WebhookRegistry::register`
+  returns `Result<String>`.
+- **Breaking:** `WebhookConfig::verify_ssl` / `verify_ssl()` exist only with the
+  new `dangerous-insecure-tls` feature and log a warning when disabled.
+- **Breaking:** `WebhookConfig` gains `egress` and `store_response_bodies`;
+  `WebhookError` is `#[non_exhaustive]` with new `ReplayDetected`,
+  `ReplayCacheFull`, `EgressRefused` and `InvalidEndpoint` variants.
+- New dependencies: `armature-http-client` (egress guard), `getrandom`.
+
+### Added
+
+- `is_denied_header`, `MIN_SECRET_LEN`, `EgressPolicy` re-export,
+  `WebhookRegistry::with_egress_policy`, `WebhookEndpoint::validate`,
+  `WebhookReceiver::{github, with_algorithm, with_github_replay_window,
+  with_replay_cache_capacity}`.
+
 ## [0.5.0] - 2026-09-15
 
 ### Changed
