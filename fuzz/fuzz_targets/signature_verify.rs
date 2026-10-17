@@ -14,13 +14,13 @@
 //! Both are checked against the same secret, so any accept of an arbitrary
 //! string is a genuine forgery rather than a key mismatch.
 //!
-//! `verify` accepts two schemes, and completeness is checked for both. The
-//! Stripe-style `t=..,v1=..` header is what `sign` emits, so that direction is
-//! covered by round-tripping the crate against itself. The GitHub-style
-//! `sha256=<hex>` header has no signer in this crate at all, so the harness
-//! constructs it here from `hmac`/`sha2` directly — an independent
-//! re-implementation rather than a round trip, which is what makes it worth
-//! asserting.
+//! Two verifiers are covered, and the schemes are kept apart: `verify` accepts
+//! only the timestamped `t=..,v2=..` header that `sign` emits (covered by
+//! round-tripping the crate against itself), and `verify_github` accepts only
+//! the GitHub-style `sha256=<hex>` header, which has no signer in this crate,
+//! so the harness constructs it here from `hmac`/`sha2` directly — an
+//! independent re-implementation rather than a round trip. Each verifier must
+//! also refuse the other scheme's header.
 
 #![no_main]
 
@@ -39,11 +39,15 @@ struct Case<'a> {
 }
 
 fuzz_target!(|case: Case<'_>| {
-    if case.secret.is_empty() || case.payload.len() > 4096 || case.forged.len() > 1024 {
+    if case.payload.len() > 4096 || case.forged.len() > 1024 {
         return;
     }
 
-    let signer = WebhookSignature::new(case.secret);
+    // Secrets shorter than MIN_SECRET_LEN are refused at construction.
+    let Ok(signer) = WebhookSignature::new(case.secret) else {
+        assert!(case.secret.len() < armature_webhooks::MIN_SECRET_LEN);
+        return;
+    };
 
     // Soundness. A tolerance large enough that the timestamped scheme cannot
     // reject on age instead of on the MAC — otherwise this would pass for the
@@ -54,9 +58,7 @@ fuzz_target!(|case: Case<'_>| {
         // signature this crate would itself have issued for this payload.
         let genuine = signer.sign(case.payload);
         assert!(
-            case.forged == genuine
-                || is_genuine_timestamped(&signer, case.payload, case.forged)
-                || case.forged == github_signature(case.secret, case.payload),
+            case.forged == genuine || is_genuine_timestamped(&signer, case.payload, case.forged),
             "an arbitrary signature was accepted: secret={:?} payload_len={} sig={:?}",
             case.secret,
             case.payload.len(),
@@ -64,8 +66,16 @@ fuzz_target!(|case: Case<'_>| {
         );
     }
 
-    // Completeness, timestamped scheme. `sign` stamps the current time, so this
-    // is the `t=..,v1=..` branch of `verify`.
+    // Soundness, GitHub scheme.
+    if matches!(signer.verify_github(case.payload, case.forged), Ok(true)) {
+        assert_eq!(
+            case.forged,
+            github_signature(case.secret, case.payload),
+            "an arbitrary GitHub-style signature was accepted"
+        );
+    }
+
+    // Completeness, timestamped scheme. `sign` stamps the current time.
     let issued = signer.sign(case.payload);
     assert_eq!(
         signer.verify(case.payload, &issued, u64::MAX).ok(),
@@ -91,7 +101,7 @@ fuzz_target!(|case: Case<'_>| {
     // silent regression there would strand every GitHub-style sender.
     let github = github_signature(case.secret, case.payload);
     assert_eq!(
-        signer.verify(case.payload, &github, u64::MAX).ok(),
+        signer.verify_github(case.payload, &github).ok(),
         Some(true),
         "a well-formed GitHub-style signature did not verify: secret={:?} sig={github:?}",
         case.secret,
@@ -105,10 +115,14 @@ fuzz_target!(|case: Case<'_>| {
     wrong[last] = if wrong[last] == b'0' { b'1' } else { b'0' };
     let wrong = String::from_utf8(wrong).expect("hex digits are ASCII");
     assert_ne!(
-        signer.verify(case.payload, &wrong, u64::MAX).ok(),
+        signer.verify_github(case.payload, &wrong).ok(),
         Some(true),
         "a GitHub-style signature verified with an altered hex digit: {wrong:?}",
     );
+
+    // Scheme separation: neither verifier accepts the other's header.
+    assert_ne!(signer.verify(case.payload, &github, u64::MAX).ok(), Some(true));
+    assert_ne!(signer.verify_github(case.payload, &issued).ok(), Some(true));
 });
 
 /// The GitHub-style header for `payload` under `secret`: a raw HMAC-SHA256 over
@@ -127,7 +141,7 @@ fn github_signature(secret: &str, payload: &[u8]) -> String {
 /// Whether `candidate` is the timestamped signature this crate would issue for
 /// `payload`, for the timestamp `candidate` itself carries.
 ///
-/// The fuzzer can in principle land on a valid `t=..,v1=..` header, and that is
+/// The fuzzer can in principle land on a valid `t=..,v2=..` header, and that is
 /// a correct accept rather than a forgery. Re-deriving it from the same secret
 /// is the only way to tell the two apart.
 fn is_genuine_timestamped(signer: &WebhookSignature, payload: &[u8], candidate: &str) -> bool {

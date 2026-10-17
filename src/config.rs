@@ -1,6 +1,7 @@
 //! Configuration for webhook client
 
 use crate::RetryPolicy;
+use armature_http_client::egress::EgressPolicy;
 use std::time::Duration;
 
 /// Configuration for the webhook client
@@ -15,8 +16,32 @@ pub struct WebhookConfig {
     /// Default retry policy
     pub retry_policy: RetryPolicy,
 
-    /// Whether to verify SSL certificates
+    /// Whether to verify TLS certificates. Only exists with the
+    /// `dangerous-insecure-tls` feature; without it, certificates are always
+    /// verified.
+    #[cfg(feature = "dangerous-insecure-tls")]
     pub verify_ssl: bool,
+
+    /// Which endpoint URLs deliveries may go to.
+    ///
+    /// The default is the strict [`EgressPolicy`]: https only, and no
+    /// loopback, private, link-local (cloud metadata), or other
+    /// special-purpose address — checked on the URL, and again on every DNS
+    /// answer at connect time, so a name that resolves (or re-resolves) to an
+    /// internal address is refused. Redirects are never followed and proxies
+    /// are never used. For local development against a stub on localhost, use
+    /// `EgressPolicy::default().allow_insecure_loopback(true)`.
+    pub egress: EgressPolicy,
+
+    /// Record (up to [`max_response_body_size`](Self::max_response_body_size)
+    /// bytes of) each receiver's response body on the
+    /// [`WebhookDelivery`](crate::WebhookDelivery). **Default: `false`.**
+    ///
+    /// Off by default because the response body is chosen by whoever controls
+    /// the endpoint; storing it and showing it back (a delivery log in an
+    /// admin UI) turns any request the sender can be induced to make into a
+    /// readable response.
+    pub store_response_bodies: bool,
 
     /// Maximum payload size in bytes
     pub max_payload_size: usize,
@@ -37,7 +62,8 @@ pub struct WebhookConfig {
     pub max_concurrent_deliveries: usize,
 
     /// Maximum number of response bytes recorded on a
-    /// [`WebhookDelivery`](crate::WebhookDelivery), per attempt.
+    /// [`WebhookDelivery`](crate::WebhookDelivery), per attempt, when
+    /// [`store_response_bodies`](Self::store_response_bodies) is enabled.
     ///
     /// The response body of a webhook is diagnostic only, but it is written
     /// into a delivery record that is often persisted. Reading it in full let
@@ -53,7 +79,10 @@ impl Default for WebhookConfig {
             timeout: Duration::from_secs(30),
             user_agent: format!("Armature-Webhooks/{}", env!("CARGO_PKG_VERSION")),
             retry_policy: RetryPolicy::default(),
+            #[cfg(feature = "dangerous-insecure-tls")]
             verify_ssl: true,
+            egress: EgressPolicy::default(),
+            store_response_bodies: false,
             max_payload_size: 1024 * 1024, // 1MB
             timestamp_tolerance: 300,      // 5 minutes
             signing_algorithm: SigningAlgorithm::HmacSha256,
@@ -119,9 +148,24 @@ impl WebhookConfigBuilder {
         self
     }
 
-    /// Set SSL verification
+    /// Set TLS certificate verification. Requires the
+    /// `dangerous-insecure-tls` feature; disabling verification logs a
+    /// warning when the client is created.
+    #[cfg(feature = "dangerous-insecure-tls")]
     pub fn verify_ssl(mut self, verify: bool) -> Self {
         self.config.verify_ssl = verify;
+        self
+    }
+
+    /// Set the egress (SSRF) policy for deliveries.
+    pub fn egress_policy(mut self, policy: EgressPolicy) -> Self {
+        self.config.egress = policy;
+        self
+    }
+
+    /// Record receivers' response bodies on deliveries (default: off).
+    pub fn store_response_bodies(mut self, store: bool) -> Self {
+        self.config.store_response_bodies = store;
         self
     }
 
@@ -191,21 +235,30 @@ mod tests {
     fn test_default_config() {
         let config = WebhookConfig::default();
         assert_eq!(config.timeout, Duration::from_secs(30));
-        assert!(config.verify_ssl);
         assert_eq!(config.max_payload_size, 1024 * 1024);
+        assert!(!config.store_response_bodies);
+        assert!(!config.egress.allows_http());
+        assert!(!config.egress.allows_loopback());
     }
 
     #[test]
     fn test_builder() {
         let config = WebhookConfig::builder()
             .timeout_secs(60)
-            .verify_ssl(false)
             .max_payload_size(2048)
+            .store_response_bodies(true)
             .build();
 
         assert_eq!(config.timeout, Duration::from_secs(60));
-        assert!(!config.verify_ssl);
         assert_eq!(config.max_payload_size, 2048);
+        assert!(config.store_response_bodies);
+    }
+
+    #[cfg(feature = "dangerous-insecure-tls")]
+    #[test]
+    fn test_builder_verify_ssl() {
+        let config = WebhookConfig::builder().verify_ssl(false).build();
+        assert!(!config.verify_ssl);
     }
 
     #[test]

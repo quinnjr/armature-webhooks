@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Errors that can occur during webhook operations
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum WebhookError {
     /// HTTP request failed
     #[error("HTTP request failed: {0}")]
@@ -48,6 +49,25 @@ pub enum WebhookError {
     /// Timeout error
     #[error("Request timed out after {0} seconds")]
     Timeout(u64),
+
+    /// The same delivery (signature or delivery id) was already accepted.
+    #[error("Replay detected: this webhook delivery was already accepted")]
+    ReplayDetected,
+
+    /// The replay cache is full of unexpired entries; the delivery is refused
+    /// rather than accepted without a replay check.
+    #[error("Replay cache is full; delivery refused")]
+    ReplayCacheFull,
+
+    /// The endpoint URL (or a DNS answer for it) was refused by the egress
+    /// policy.
+    #[error("{0}")]
+    EgressRefused(#[from] armature_http_client::egress::EgressError),
+
+    /// The endpoint is invalid (bad URL, forbidden or malformed custom header,
+    /// short secret).
+    #[error("Invalid webhook endpoint: {0}")]
+    InvalidEndpoint(String),
 
     /// Internal error
     #[error("Internal error: {0}")]
