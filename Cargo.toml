@@ -1,6 +1,6 @@
 [package]
 name = "armature-webhooks"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.94.1"
 authors = ["Joseph Quinn <quinn.josephr@proton.me>"]
@@ -13,7 +13,7 @@ categories = ["web-programming", "asynchronous"]
 
 [dependencies]
 # Core dependencies
-armature-core = { version = "0.10" }
+armature-core = { version = "0.11" }
 async-trait = "0.1"
 thiserror = "2.0"
 tracing = "0.1"
@@ -47,7 +47,7 @@ uuid = { version = "1.26", features = ["v4", "serde"] }
 url = "2.5"
 
 # SSRF guard (EgressPolicy) shared with armature-push
-armature-http-client = { version = "0.2" }
+armature-http-client = { version = "0.3" }
 
 # Webhook signing-secret generation (32 bytes from the OS CSPRNG)
 getrandom = "0.3"
