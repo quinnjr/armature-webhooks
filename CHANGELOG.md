@@ -9,6 +9,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-17
+
 ### Security
 
 - **Webhook delivery SSRF (C2).** Every delivery now goes through an
