@@ -1,29 +1,48 @@
 //! Webhook endpoint registry
 
 use crate::{Result, WebhookEndpoint, WebhookError};
+use armature_http_client::egress::EgressPolicy;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// Registry for managing webhook endpoints
+///
+/// Every endpoint is validated ([`WebhookEndpoint::validate`]) against the
+/// registry's [`EgressPolicy`] on [`register`](Self::register) and
+/// [`update`](Self::update).
 #[derive(Debug, Clone, Default)]
 pub struct WebhookRegistry {
     endpoints: Arc<RwLock<HashMap<String, WebhookEndpoint>>>,
+    policy: EgressPolicy,
 }
 
 impl WebhookRegistry {
-    /// Create a new empty registry
+    /// Create a new empty registry using the strict default [`EgressPolicy`].
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a new empty registry that validates endpoints against `policy`
+    /// (e.g. one allowing loopback, for local development).
+    pub fn with_egress_policy(policy: EgressPolicy) -> Self {
         Self {
-            endpoints: Arc::new(RwLock::new(HashMap::new())),
+            endpoints: Arc::default(),
+            policy,
         }
     }
 
-    /// Register a new endpoint
-    pub fn register(&self, endpoint: WebhookEndpoint) -> String {
+    /// Validate and register an endpoint, returning its id.
+    ///
+    /// # Errors
+    ///
+    /// The endpoint's URL, custom headers or secret fail
+    /// [`WebhookEndpoint::validate`].
+    pub fn register(&self, endpoint: WebhookEndpoint) -> Result<String> {
+        endpoint.validate(&self.policy)?;
         let id = endpoint.id.clone();
         let mut endpoints = self.endpoints.write().unwrap();
         endpoints.insert(id.clone(), endpoint);
-        id
+        Ok(id)
     }
 
     /// Unregister an endpoint by ID
@@ -92,6 +111,7 @@ impl WebhookRegistry {
 
     /// Update an endpoint
     pub fn update(&self, id: &str, endpoint: WebhookEndpoint) -> Result<()> {
+        endpoint.validate(&self.policy)?;
         let mut endpoints = self.endpoints.write().unwrap();
         if endpoints.contains_key(id) {
             endpoints.insert(id.to_string(), endpoint);
@@ -157,6 +177,7 @@ mod tests {
             .id(id)
             .events(events)
             .build()
+            .unwrap()
     }
 
     #[test]
@@ -164,7 +185,7 @@ mod tests {
         let registry = WebhookRegistry::new();
 
         let endpoint = create_test_endpoint("test-1", vec!["user.created"]);
-        let id = registry.register(endpoint);
+        let id = registry.register(endpoint).unwrap();
 
         let retrieved = registry.get(&id);
         assert!(retrieved.is_some());
@@ -176,7 +197,7 @@ mod tests {
         let registry = WebhookRegistry::new();
 
         let endpoint = create_test_endpoint("test-1", vec![]);
-        let id = registry.register(endpoint);
+        let id = registry.register(endpoint).unwrap();
 
         assert!(registry.exists(&id));
         registry.unregister(&id);
@@ -187,12 +208,13 @@ mod tests {
     fn test_get_endpoints_for_event() {
         let registry = WebhookRegistry::new();
 
-        registry.register(create_test_endpoint(
-            "ep-1",
-            vec!["user.created", "user.updated"],
-        ));
-        registry.register(create_test_endpoint("ep-2", vec!["user.created"]));
-        registry.register(create_test_endpoint("ep-3", vec!["order.created"]));
+        for endpoint in [
+            create_test_endpoint("ep-1", vec!["user.created", "user.updated"]),
+            create_test_endpoint("ep-2", vec!["user.created"]),
+            create_test_endpoint("ep-3", vec!["order.created"]),
+        ] {
+            registry.register(endpoint).unwrap();
+        }
 
         let user_created_endpoints = registry.get_endpoints_for_event("user.created");
         assert_eq!(user_created_endpoints.len(), 2);
@@ -209,7 +231,7 @@ mod tests {
         let registry = WebhookRegistry::new();
 
         let endpoint = create_test_endpoint("test-1", vec!["user.created"]);
-        let id = registry.register(endpoint);
+        let id = registry.register(endpoint).unwrap();
 
         // Initially enabled
         assert!(registry.get(&id).unwrap().enabled);
@@ -232,7 +254,7 @@ mod tests {
         let registry = WebhookRegistry::new();
 
         let endpoint = create_test_endpoint("test-1", vec![]);
-        let id = registry.register(endpoint);
+        let id = registry.register(endpoint).unwrap();
 
         // Record failures
         registry.record_failure(&id).unwrap();
@@ -254,9 +276,13 @@ mod tests {
     fn test_find_by_url() {
         let registry = WebhookRegistry::new();
 
-        registry.register(WebhookEndpoint::new("https://api.example.com/webhook"));
-        registry.register(WebhookEndpoint::new("https://hooks.example.com/receive"));
-        registry.register(WebhookEndpoint::new("https://other.com/webhook"));
+        for url in [
+            "https://api.example.com/webhook",
+            "https://hooks.example.com/receive",
+            "https://other.com/webhook",
+        ] {
+            registry.register(WebhookEndpoint::new(url)).unwrap();
+        }
 
         let example_endpoints = registry.find_by_url("example.com");
         assert_eq!(example_endpoints.len(), 2);
@@ -266,12 +292,38 @@ mod tests {
     }
 
     #[test]
+    fn test_register_validates_deserialized_endpoints() {
+        // Endpoints are `Deserialize`, so one built from API input never went
+        // through the builder; registration must validate it.
+        let registry = WebhookRegistry::new();
+        let mut endpoint = WebhookEndpoint::new("https://169.254.169.254/latest/meta-data/");
+        assert!(registry.register(endpoint.clone()).is_err());
+
+        endpoint.url = "https://example.com/hook".to_string();
+        endpoint
+            .headers
+            .insert("Metadata-Flavor".to_string(), "Google".to_string());
+        assert!(registry.register(endpoint.clone()).is_err());
+
+        endpoint.headers.clear();
+        let id = registry.register(endpoint.clone()).unwrap();
+
+        endpoint.url = "http://10.0.0.1/".to_string();
+        assert!(registry.update(&id, endpoint).is_err());
+        assert_eq!(registry.get(&id).unwrap().url, "https://example.com/hook");
+    }
+
+    #[test]
     fn test_count() {
         let registry = WebhookRegistry::new();
         assert_eq!(registry.count(), 0);
 
-        registry.register(create_test_endpoint("1", vec![]));
-        registry.register(create_test_endpoint("2", vec![]));
+        registry
+            .register(create_test_endpoint("1", vec![]))
+            .unwrap();
+        registry
+            .register(create_test_endpoint("2", vec![]))
+            .unwrap();
         assert_eq!(registry.count(), 2);
 
         registry.clear();
