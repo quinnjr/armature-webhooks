@@ -110,7 +110,7 @@ fuzz_target!(|case: Case<'_>| {
     // The mirror of the above: the same header one hex digit off must not
     // verify. Without this, a `verify` that accepted any `sha256=` header at all
     // would still satisfy the completeness assertion.
-    let mut wrong = github.into_bytes();
+    let mut wrong = github.clone().into_bytes();
     let last = wrong.len() - 1;
     wrong[last] = if wrong[last] == b'0' { b'1' } else { b'0' };
     let wrong = String::from_utf8(wrong).expect("hex digits are ASCII");
