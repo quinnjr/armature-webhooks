@@ -9,6 +9,14 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-29
+
+### Changed
+
+- Requires `armature-core` 0.12 (was `0.11`).
+- The `signature_verify` fuzz target compiles again (it used a moved value).
+- CI: actions pinned to commit SHAs, a least-privilege `GITHUB_TOKEN`, and Dependabot for actions.
+
 ## [0.6.0] - 2026-10-17
 
 ### Security
